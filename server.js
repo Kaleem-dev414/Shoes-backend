@@ -12,9 +12,30 @@ let liveDB=null, mongoWrites=Promise.resolve();
 const StoredDB=mongoose.model('AppDatabase',new mongoose.Schema({_id:String,payload:mongoose.Schema.Types.Mixed},{strict:false,versionKey:false}));
 function readDB(){if(liveDB)return structuredClone(liveDB);try{return Object.assign(emptyDB(),JSON.parse(fs.readFileSync(DATA_FILE,'utf8')))}catch{return emptyDB()}}
 function writeDB(db){liveDB=structuredClone(db);fs.writeFileSync(DATA_FILE,JSON.stringify(db,null,2));if(mongoose.connection.readyState===1){const snapshot=structuredClone(db);mongoWrites=mongoWrites.catch(e=>console.error('Previous database save failed:',e)).then(()=>StoredDB.replaceOne({_id:'main'},{_id:'main',payload:snapshot},{upsert:true}));}}
- function tok(p,e='7d'){return jwt.sign(p,JWT_SECRET,{expiresIn:e})} function auth(req,res,next){try{req.user=jwt.verify((req.headers.authorization||'').replace(/^Bearer\s+/i,''),JWT_SECRET);next()}catch{return res.status(401).json({message:'Unauthorized'})}} function adminOnly(req,res,next){if(req.user.role!=='admin')return res.status(403).json({message:'Admin only'});next()}
+ function tok(p,e='7d'){return jwt.sign(p,JWT_SECRET,{expiresIn:e})} function auth(req,res,next){try{req.user=jwt.verify((req.headers.authorization||'').replace(/^Bearer\s+/i,''),JWT_SECRET);if(req.user.role==='user'&&!readDB().users.some(u=>String(u.id)===String(req.user.id)&&u.approved))return res.status(403).json({message:'Account unavailable or deleted.'});next()}catch{return res.status(401).json({message:'Unauthorized'})}} function adminOnly(req,res,next){if(req.user.role!=='admin')return res.status(403).json({message:'Admin only'});next()}
 async function adminCreds(db){if(!db.settings.adminPasswordHash)db.settings.adminPasswordHash=await bcrypt.hash(ENV_ADMIN.password,10);return {username:db.settings.adminUsername||ENV_ADMIN.username,email:db.settings.adminEmail||ENV_ADMIN.email,passwordHash:db.settings.adminPasswordHash}}
 const publicUser=u=>({id:u.id,username:u.username,email:u.email,approved:u.approved,shopName:u.shopName||'Sajid Shoes',shopLogo:u.shopLogo||'',requestedShopName:u.requestedShopName||'',shopAddress:u.shopAddress||'',shopContact:u.shopContact||'',contactChangePending:u.contactChangePending||null,allowSelfReset:!!u.allowSelfReset,lowStockAlertsEnabled:u.lowStockAlertsEnabled!==false,pages:{...(u.pages||{}),reports:true},createdAt:u.createdAt});
+// Cloudinary credentials remain exclusively on the server.
+const cloudName=process.env.CLOUDINARY_CLOUD_NAME||process.env.CLOUDINARY_NAME;
+const cloudKey=process.env.CLOUDINARY_API_KEY;
+const cloudSecret=process.env.CLOUDINARY_API_SECRET||process.env.CLOUDIANRY_API_SECRET;
+app.get('/api/media/status',auth,(req,res)=>res.json({configured:!!(cloudName&&cloudKey&&cloudSecret),cloudName:cloudName||null}));
+app.post('/api/media/images',auth,async(req,res)=>{
+ try{
+  const db=readDB(),u=db.users.find(x=>x.id===req.user.id);
+  if(req.user.role!=='user'||!u?.approved)return res.status(403).json({message:'Approved user account required.'});
+  if(!cloudName||!cloudKey||!cloudSecret)return res.status(503).json({message:'Cloudinary is not configured on the backend.'});
+  const input=String(req.body.image||''),match=input.match(/^data:image\/(jpeg|png|webp|gif);base64,([A-Za-z0-9+/=]+)$/);
+  if(!match)return res.status(400).json({message:'Only JPG, PNG, WebP and GIF images are supported.'});
+  const bytes=Buffer.from(match[2],'base64');if(!bytes.length||bytes.length>5*1024*1024)return res.status(400).json({message:'Image must be between 1 byte and 5 MB.'});
+  const mime='image/'+match[1],head=bytes.subarray(0,12),valid=match[1]==='jpeg'?head[0]===255&&head[1]===216:match[1]==='png'?head.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])):match[1]==='gif'?/^GIF8[79]a/.test(head.toString()):head.subarray(0,4).toString()==='RIFF'&&head.subarray(8,12).toString()==='WEBP';
+  if(!valid)return res.status(400).json({message:'Image contents do not match the file type.'});
+  const form=new FormData();form.set('file',new Blob([bytes],{type:mime}),'product.'+match[1]);form.set('folder','shoes/'+String(req.user.id).replace(/[^a-zA-Z0-9_-]/g,''));
+  const response=await fetch('https://api.cloudinary.com/v1_1/'+encodeURIComponent(cloudName)+'/image/upload',{method:'POST',headers:{Authorization:'Basic '+Buffer.from(cloudKey+':'+cloudSecret).toString('base64')},body:form,signal:AbortSignal.timeout(30000)});
+  const result=await response.json();if(!response.ok||!result.secure_url)return res.status(502).json({message:'Cloudinary upload failed. Check backend credentials and try again.'});
+  res.json({secure_url:result.secure_url,public_id:result.public_id,width:result.width,height:result.height});
+ }catch(e){res.status(502).json({message:'Image upload could not complete. Please try again.'});}
+});
 app.get('/health',(_q,r)=>r.json({ok:true,service:'Sajid Shoes API'}));app.get('/api/health',(_q,r)=>r.json({ok:true}));
 app.post('/api/auth/register',async(req,res)=>{const username=String(req.body.username||'').trim(),email=String(req.body.email||'').trim().toLowerCase(),password=String(req.body.password||'');if(!username||!email||password.length<6)return res.status(400).json({message:'Email, username and a password of at least 6 characters are required.'});const db=readDB();if(db.users.some(u=>u.username.toLowerCase()===username.toLowerCase()||u.email===email))return res.status(409).json({message:'Email or username already exists.'});const requestedShopName=String(req.body.requestedShopName||'Sajid Shoes').trim().slice(0,65)||'Sajid Shoes';const id=Date.now().toString();db.users.push({id,username,email,requestedShopName,shopName:'Sajid Shoes',shopLogo:'',shopAddress:'',shopContact:'',contactChangePending:null,passwordHash:await bcrypt.hash(password,10),approved:false,pages:Object.fromEntries(['dashboard','sale','products','stock','purchases','customers','khata','bills','income','reports'].map(x=>[x,true])),createdAt:new Date().toISOString()});db.userStates[id]=blankState();db.archives[id]=[];writeDB(db);res.status(201).json({ok:true,message:'Account created. Waiting for admin approval.'})});
 app.post('/api/auth/login',async(req,res)=>{const login=String(req.body.login||req.body.username||'').trim().toLowerCase(),password=String(req.body.password||''),db=readDB(),u=db.users.find(x=>x.username.toLowerCase()===login||x.email===login);if(!u||!await bcrypt.compare(password,u.passwordHash))return res.status(401).json({message:'Invalid email/username or password.'});if(!u.approved)return res.status(403).json({message:'Your account is waiting for admin approval.'});res.json({token:tok({id:u.id,username:u.username,role:'user'}),user:{...publicUser(u),role:'user'}})});
@@ -134,7 +155,23 @@ app.post('/api/admin/reset-requests/:id/approve',auth,adminOnly,(req,res)=>{cons
 app.post('/api/auth/password-reset/complete',async(req,res)=>{const db=readDB(),r=db.resetRequests.find(x=>x.id===String(req.body.requestId||'')),password=String(req.body.password||'');if(!r||r.status!=='approved'||r.used||Date.now()>Number(r.expiresAt||0))return res.status(400).json({message:'Approval is missing or the 2-minute reset window expired.'});if(password.length<6)return res.status(400).json({message:'Password must be at least 6 characters.'});const u=db.users.find(x=>x.id===r.userId);u.passwordHash=await bcrypt.hash(password,10);r.used=true;r.status='completed';writeDB(db);res.json({ok:true,message:'Password changed successfully.'})});
 app.post('/api/auth/admin/reset/verify-pin',(req,res)=>{if(String(req.body.pin||'')!==ADMIN_PIN)return res.status(401).json({message:'Invalid private 6-digit code.'});res.json({resetToken:tok({role:'admin-reset'},'2m')})});
 app.post('/api/auth/admin/reset/complete',async(req,res)=>{try{const t=jwt.verify(String(req.body.resetToken||''),JWT_SECRET);if(t.role!=='admin-reset')throw 0;const password=String(req.body.password||'');if(password.length<6)return res.status(400).json({message:'Password must be at least 6 characters.'});const db=readDB();db.settings.adminPasswordHash=await bcrypt.hash(password,10);writeDB(db);res.json({ok:true,message:'Admin password changed.'})}catch{return res.status(400).json({message:'Verification expired. Verify the private code again.'})}});
-app.use(express.static(path.join(__dirname,'public')));app.get(/.*/,(_q,r)=>r.sendFile(path.join(__dirname,'public','index.html')));app.use((e,_q,r,_n)=>{console.error(e);r.status(500).json({message:e.message||'Server error'})});async function start(){
+app.use(express.static(path.join(__dirname,'public')));app.get(/.*/,(_q,r)=>r.sendFile(path.join(__dirname,'public','index.html')));app.use((e,_q,r,_n)=>{console.error(e);r.status(500).json({message:e.message||'Server error'})});
+const REQUESTED_ACCOUNT_REMOVAL='remove-faiz-kaleem-2026-10-02-v1';
+function purgeRequestedAccounts(db){
+ db.settings=db.settings||{};
+ if(db.settings.completedAccountRemovals?.includes(REQUESTED_ACCOUNT_REMOVAL))return false;
+ const names=new Set(['faiz','kaleem']),ids=new Set(['1790627735459']);
+ const matches=x=>names.has(String(x?.username||'').trim().toLowerCase());
+ for(const key of ['users','deletedUsers','shopResetRequests','resetRequests'])for(const row of db[key]||[])if(matches(row)){const id=row.userId||row.originalUserId||(key==='users'?row.id:null);if(id)ids.add(String(id));}
+ const targeted=row=>matches(row)||[row?.id,row?.userId,row?.originalUserId,row?.accountId].some(id=>ids.has(String(id)));
+ db.users=(db.users||[]).filter(row=>!targeted(row));
+ for(const key of ['userStates','protectedSnapshots','adminRestoreDrafts','archives','restoreNotices','importHistory']){const value=db[key];if(Array.isArray(value))db[key]=value.filter(row=>!targeted(row));else if(value&&typeof value==='object')for(const id of ids)delete value[id];}
+ for(const key of ['deletedUsers','shopResetRequests','resetRequests'])db[key]=(db[key]||[]).filter(row=>!targeted(row));
+ db.settings.completedAccountRemovals=[...(db.settings.completedAccountRemovals||[]),REQUESTED_ACCOUNT_REMOVAL];
+ return true;
+}
+
+async function start(){
  if(process.env.MONGODB_URI){
    await mongoose.connect(process.env.MONGODB_URI,{serverSelectionTimeoutMS:15000});
    const saved=await StoredDB.findById('main').lean();
@@ -143,6 +180,7 @@ app.use(express.static(path.join(__dirname,'public')));app.get(/.*/,(_q,r)=>r.se
    console.log('MongoDB connected: account data is database-backed');
  }else if(process.env.NODE_ENV==='production')throw Error('MONGODB_URI is required in production to protect account data across redeploys.');
  else console.warn('Local JSON mode: set MONGODB_URI before deploying for permanent storage.');
+ const cleaned=readDB();if(purgeRequestedAccounts(cleaned)){writeDB(cleaned);await mongoWrites;console.log('Requested account removal completed.');}
  app.listen(port,()=>console.log(`server is running on port ${port}`));
 }
 start().catch(e=>{console.error('Startup failed:',e.message);process.exit(1)});
